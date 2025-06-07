@@ -139,8 +139,8 @@ class ScannedDevicesViewModel @Inject constructor(
     }
 
     companion object {
-        private const val SCAN_PERIOD = 15000L
-        private const val ADVERTISE_PERIOD = 15000L
+        private const val SCAN_PERIOD = 150000L
+        private const val ADVERTISE_PERIOD = 150000L
     }
 }
 

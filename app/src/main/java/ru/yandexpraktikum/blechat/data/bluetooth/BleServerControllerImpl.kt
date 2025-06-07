@@ -37,6 +37,8 @@ import java.nio.charset.Charset
 import java.util.UUID
 import javax.inject.Inject
 
+val CLIENT_CONFIG_DESCRIPTOR = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
 class BleServerControllerImpl @Inject constructor(
     @ApplicationContext private val context: Context,
     private val bluetoothManager: BluetoothManager?,
@@ -44,7 +46,6 @@ class BleServerControllerImpl @Inject constructor(
     private val viewModelScope: CoroutineScope
 ): BleServerController {
 
-    private val CLIENT_CONFIG_DESCRIPTOR = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     private var gattServer: BluetoothGattServer? = null
     private var gattServerCallback: BluetoothGattServerCallback? = null

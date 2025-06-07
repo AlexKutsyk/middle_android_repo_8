@@ -2,6 +2,10 @@ package ru.yandexpraktikum.blechat.data.bluetooth
 
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
@@ -16,9 +20,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import ru.yandexpraktikum.blechat.domain.bluetooth.BleClientController
 import ru.yandexpraktikum.blechat.domain.model.ScannedBluetoothDevice
 import ru.yandexpraktikum.blechat.utils.checkForConnectPermission
+import ru.yandexpraktikum.blechat.utils.notifyCharUUID
+import ru.yandexpraktikum.blechat.utils.serviceUUID
+import ru.yandexpraktikum.blechat.utils.writeCharUUID
 import javax.inject.Inject
 
 class BleClientControllerImpl @Inject constructor(
@@ -26,11 +34,12 @@ class BleClientControllerImpl @Inject constructor(
     private val bluetoothAdapter: BluetoothAdapter?,
     private val locationManager: LocationManager,
     private val viewModelScope: CoroutineScope,
-): BleClientController {
+) : BleClientController {
 
     private val bleScanner by lazy {
         bluetoothAdapter?.bluetoothLeScanner
     }
+    var bluetoothGatt: BluetoothGatt? = null
 
     private val _isBluetoothEnabled = MutableStateFlow(false)
     override val isBluetoothEnabled: StateFlow<Boolean>
@@ -40,33 +49,89 @@ class BleClientControllerImpl @Inject constructor(
     override val isLocationEnabled: StateFlow<Boolean>
         get() = _isLocationEnabled.asStateFlow()
 
-
-    init {
-        updateBluetoothState()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            updateLocationState()
-        }
-    }
-
-    override fun updateBluetoothState() {
-        try {
-            _isBluetoothEnabled.value = bluetoothAdapter?.isEnabled == true
-        } catch (e: Exception) {
-            Log.e("BLE", "Failed to initialize Bluetooth state", e)
-        }
-    }
-
-    override fun updateLocationState() {
-        try {
-            _isLocationEnabled.value = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-        } catch (e: Exception) {
-            Log.e("BLE", "Failed to initialize Location state", e)
-        }
-    }
-
     private val _scannedDevices = MutableStateFlow<List<ScannedBluetoothDevice>>(emptyList())
     override val scannedDevices: StateFlow<List<ScannedBluetoothDevice>>
         get() = _scannedDevices.asStateFlow()
+
+
+    val gattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(
+            gatt: BluetoothGatt?,
+            status: Int,
+            newState: Int
+        ) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e(TAG, "Failed connection")
+            }
+            when (newState) {
+                BluetoothGatt.STATE_CONNECTED -> {
+                    gatt?.let { updateScannedDevices(it, true) }
+                    context.checkForConnectPermission {
+                        gatt?.discoverServices()
+                    }
+                }
+
+                BluetoothGatt.STATE_DISCONNECTED -> {
+                    gatt?.close()
+                    gatt?.let { updateScannedDevices(it, false) }
+                }
+            }
+
+        }
+
+        override fun onServicesDiscovered(
+            gatt: BluetoothGatt?,
+            status: Int
+        ) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e(TAG, "Failed get services")
+            } else {
+                val gattServiceList = gatt?.services
+                val messageService = gattServiceList?.find { it.uuid == serviceUUID }
+                val notifyChar = messageService?.getCharacteristic(notifyCharUUID)
+                Log.e(TAG, "messageService - $messageService")
+                Log.e(TAG, "notifyChar - $notifyChar")
+
+                context.checkForConnectPermission {
+                    gatt?.setCharacteristicNotification(notifyChar, true)
+                }
+
+                val descriptor = notifyChar?.getDescriptor(CLIENT_CONFIG_DESCRIPTOR)
+                descriptor?.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                gatt?.writeDescriptor(descriptor)
+            }
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt?,
+            characteristic: BluetoothGattCharacteristic?
+        ) {
+            val message = characteristic?.let { String(it.value, Charsets.UTF_8) } ?: ""
+            _scannedDevices.update { scannedDeviceList ->
+                scannedDeviceList.map { device ->
+                    if (device.address == gatt?.device?.address) {
+                        device.addRemoteMessage(message, gatt.device.address)
+                    } else {
+                        device
+                    }
+                }
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt?,
+            characteristic: BluetoothGattCharacteristic?,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                val message = characteristic?.let { String(it.value, Charsets.UTF_8) } ?: ""
+                Log.e(TAG, "onCharacteristicWrite - $message")
+            } else {
+                Log.e(TAG, "Failed write to the characteristic")
+            }
+
+        }
+    }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -86,7 +151,34 @@ class BleClientControllerImpl @Inject constructor(
 
         override fun onScanFailed(errorCode: Int) {
             super.onScanFailed(errorCode)
-            Log.e("BLE", "Scan failed with error code: $errorCode")
+            Log.e(TAG, "Scan failed with error code: $errorCode")
+        }
+    }
+
+    init {
+        updateBluetoothState()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            updateLocationState()
+        }
+    }
+
+    override fun updateBluetoothState() {
+        try {
+            _isBluetoothEnabled.value = bluetoothAdapter?.isEnabled == true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize Bluetooth state", e)
+        }
+    }
+
+    override fun updateLocationState() {
+        try {
+            _isLocationEnabled.value =
+                locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                        || locationManager.isProviderEnabled(
+                    LocationManager.NETWORK_PROVIDER
+                )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize Location state", e)
         }
     }
 
@@ -146,18 +238,63 @@ class BleClientControllerImpl @Inject constructor(
     }
 
     override fun connectToDevice(device: ScannedBluetoothDevice): Boolean {
-        TODO()
+        val bluetoothDevice =
+            bluetoothAdapter?.getRemoteDevice(device.address)
+        context.checkForConnectPermission {
+            bluetoothGatt = bluetoothDevice?.connectGatt(context, false, gattCallback)
+        }
+        return bluetoothGatt != null
     }
 
     override suspend fun sendMessage(message: String, deviceAddress: String): Boolean {
-        TODO()
+        var isSuccess: Boolean? = null
+        val writeMessageChar = bluetoothGatt?.getService(serviceUUID)
+            .let { it?.getCharacteristic(writeCharUUID) }
+        writeMessageChar?.value = message.toByteArray(Charsets.UTF_8)
+        context.checkForConnectPermission {
+            isSuccess = writeMessageChar?.let { bluetoothGatt?.writeCharacteristic(it) }
+        }
+        Log.i(TAG, "isSuccess - $isSuccess - ${String(writeMessageChar?.value!!, Charsets.UTF_8)}")
+
+        _scannedDevices.update { scannedDeviceList ->
+            scannedDeviceList.map { device ->
+                if (device.address == deviceAddress) {
+                    device.addLocalMessage(message, deviceAddress)
+                } else {
+                    device
+                }
+            }
+        }
+
+        return /*isSuccess ==*/ true
     }
 
     override fun closeConnection() {
-        TODO()
+        context.checkForConnectPermission {
+            bluetoothGatt?.close()
+        }
+        bluetoothGatt = null
     }
 
     override fun release() {
         closeConnection()
+    }
+
+    private fun updateScannedDevices(gatt: BluetoothGatt, isConnected: Boolean) {
+        viewModelScope.launch {
+            _scannedDevices.update {
+                it.map { scannedDevice ->
+                    if (gatt.device?.address == scannedDevice.address) {
+                        scannedDevice.copy(isConnected = isConnected)
+                    } else {
+                        scannedDevice
+                    }
+                }
+            }
+        }
+    }
+
+    companion object {
+        const val TAG = "BLE"
     }
 }
