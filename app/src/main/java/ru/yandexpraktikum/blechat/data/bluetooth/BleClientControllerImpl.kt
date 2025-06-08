@@ -5,7 +5,7 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
@@ -21,12 +21,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import ru.yandexpraktikum.blechat.R
 import ru.yandexpraktikum.blechat.domain.bluetooth.BleClientController
 import ru.yandexpraktikum.blechat.domain.model.ScannedBluetoothDevice
+import ru.yandexpraktikum.blechat.presentation.notifications.NotificationsHelper
 import ru.yandexpraktikum.blechat.utils.checkForConnectPermission
 import ru.yandexpraktikum.blechat.utils.notifyCharUUID
 import ru.yandexpraktikum.blechat.utils.serviceUUID
 import ru.yandexpraktikum.blechat.utils.writeCharUUID
+import java.nio.charset.Charset
 import javax.inject.Inject
 
 class BleClientControllerImpl @Inject constructor(
@@ -34,6 +37,7 @@ class BleClientControllerImpl @Inject constructor(
     private val bluetoothAdapter: BluetoothAdapter?,
     private val locationManager: LocationManager,
     private val viewModelScope: CoroutineScope,
+    private val notificationsHelper: NotificationsHelper
 ) : BleClientController {
 
     private val bleScanner by lazy {
@@ -60,23 +64,23 @@ class BleClientControllerImpl @Inject constructor(
             status: Int,
             newState: Int
         ) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e(TAG, "Failed connection")
-            }
-            when (newState) {
-                BluetoothGatt.STATE_CONNECTED -> {
-                    gatt?.let { updateScannedDevices(it, true) }
-                    context.checkForConnectPermission {
-                        gatt?.discoverServices()
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                when (newState) {
+                    BluetoothGatt.STATE_CONNECTED -> {
+                        gatt?.let { updateScannedDevices(it, true) }
+                        context.checkForConnectPermission {
+                            gatt?.discoverServices()
+                        }
+                    }
+
+                    BluetoothGatt.STATE_DISCONNECTED -> {
+                        gatt?.let { updateScannedDevices(it, false) }
+                        closeConnection()
                     }
                 }
-
-                BluetoothGatt.STATE_DISCONNECTED -> {
-                    gatt?.close()
-                    gatt?.let { updateScannedDevices(it, false) }
-                }
+            } else {
+                Log.e(TAG, "Failed connection")
             }
-
         }
 
         override fun onServicesDiscovered(
@@ -89,16 +93,32 @@ class BleClientControllerImpl @Inject constructor(
                 val gattServiceList = gatt?.services
                 val messageService = gattServiceList?.find { it.uuid == serviceUUID }
                 val notifyChar = messageService?.getCharacteristic(notifyCharUUID)
-                Log.e(TAG, "messageService - $messageService")
-                Log.e(TAG, "notifyChar - $notifyChar")
-
                 context.checkForConnectPermission {
                     gatt?.setCharacteristicNotification(notifyChar, true)
                 }
+            }
+        }
 
-                val descriptor = notifyChar?.getDescriptor(CLIENT_CONFIG_DESCRIPTOR)
-                descriptor?.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                gatt?.writeDescriptor(descriptor)
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            if (status == BluetoothStatusCodes.SUCCESS) {
+                val clientAddress = bluetoothAdapter?.address
+                val message = String(value, Charset.defaultCharset())
+                _scannedDevices.update { scannedDeviceList ->
+                    scannedDeviceList.map { device ->
+                        if (device.address == clientAddress) {
+                            device.addLocalMessage(message, clientAddress)
+                        } else {
+                            device
+                        }
+                    }
+                }
+            } else {
+                Log.e(TAG, "Failed read the characteristic")
             }
         }
 
@@ -116,6 +136,10 @@ class BleClientControllerImpl @Inject constructor(
                     }
                 }
             }
+            notificationsHelper.notifyOnMessageReceived(
+                context.resources.getString(R.string.new_message),
+                message
+            )
         }
 
         override fun onCharacteristicWrite(
@@ -124,11 +148,13 @@ class BleClientControllerImpl @Inject constructor(
             status: Int
         ) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                val message = characteristic?.let { String(it.value, Charsets.UTF_8) } ?: ""
-                Log.e(TAG, "onCharacteristicWrite - $message")
+                context.checkForConnectPermission {
+                    gatt?.readCharacteristic(characteristic)
+                }
             } else {
                 Log.e(TAG, "Failed write to the characteristic")
             }
+
 
         }
     }
@@ -250,23 +276,23 @@ class BleClientControllerImpl @Inject constructor(
         var isSuccess: Boolean? = null
         val writeMessageChar = bluetoothGatt?.getService(serviceUUID)
             .let { it?.getCharacteristic(writeCharUUID) }
-        writeMessageChar?.value = message.toByteArray(Charsets.UTF_8)
-        context.checkForConnectPermission {
-            isSuccess = writeMessageChar?.let { bluetoothGatt?.writeCharacteristic(it) }
-        }
-        Log.i(TAG, "isSuccess - $isSuccess - ${String(writeMessageChar?.value!!, Charsets.UTF_8)}")
 
-        _scannedDevices.update { scannedDeviceList ->
-            scannedDeviceList.map { device ->
-                if (device.address == deviceAddress) {
-                    device.addLocalMessage(message, deviceAddress)
-                } else {
-                    device
+        context.checkForConnectPermission {
+            isSuccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val result = writeMessageChar?.let {
+                    bluetoothGatt?.writeCharacteristic(
+                        it,
+                        message.toByteArray(Charset.defaultCharset()),
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    )
                 }
+                result == BluetoothStatusCodes.SUCCESS
+            } else {
+                writeMessageChar?.value = message.toByteArray(Charset.defaultCharset())
+                writeMessageChar?.let { bluetoothGatt?.writeCharacteristic(it) }
             }
         }
-
-        return /*isSuccess ==*/ true
+        return isSuccess == true
     }
 
     override fun closeConnection() {
