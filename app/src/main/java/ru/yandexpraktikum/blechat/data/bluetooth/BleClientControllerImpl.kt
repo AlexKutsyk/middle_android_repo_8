@@ -126,7 +126,7 @@ class BleClientControllerImpl @Inject constructor(
             gatt: BluetoothGatt?,
             characteristic: BluetoothGattCharacteristic?
         ) {
-            val message = characteristic?.let { String(it.value, Charsets.UTF_8) } ?: ""
+            val message = characteristic?.let { String(it.value, Charset.defaultCharset()) } ?: ""
             _scannedDevices.update { scannedDeviceList ->
                 scannedDeviceList.map { device ->
                     if (device.address == gatt?.device?.address) {
