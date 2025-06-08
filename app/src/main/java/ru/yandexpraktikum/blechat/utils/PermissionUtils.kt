@@ -33,7 +33,18 @@ fun Context.checkForConnectPermission(action: () -> Unit) {
             this,
             Manifest.permission.BLUETOOTH_CONNECT
         ) == PackageManager.PERMISSION_GRANTED -> action.invoke()
+
         Build.VERSION.SDK_INT < Build.VERSION_CODES.S -> action.invoke()
+    }
+}
+
+fun Context.checkNotificationPermission(action: () -> Unit) {
+    if (ActivityCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+    ) {
+        action.invoke()
     }
 }
 
@@ -53,7 +64,6 @@ fun Context.bluetoothLauncher(
     }
     return enableBluetoothLauncher
 }
-
 
 @Composable
 fun advertiseLauncher(
